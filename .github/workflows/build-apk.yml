@@ -17,10 +17,12 @@ jobs:
           channel: stable
       - name: Build
         run: |
+          SRC=$(dirname "$(find . -name pubspec.yaml -not -path './build_app/*' | head -1)")
+          echo "Source: $SRC"
           flutter create --platforms=android --project-name payam --org com.payam build_app
-          cp app/pubspec.yaml build_app/pubspec.yaml
+          cp "$SRC/pubspec.yaml" build_app/pubspec.yaml
           rm -rf build_app/lib build_app/test
-          cp -r app/lib build_app/lib
+          cp -r "$SRC/lib" build_app/lib
           cd build_app
           M=android/app/src/main/AndroidManifest.xml
           sed -i 's#<application#<uses-permission android:name="android.permission.INTERNET"/>\n    <application android:usesCleartextTraffic="true"#' $M
