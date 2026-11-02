@@ -19,14 +19,74 @@ jobs:
         run: |
           SRC=$(dirname "$(find . -name pubspec.yaml -not -path './build_app/*' | head -1)")
           echo "Source: $SRC"
+          cat > /tmp/patch_android.py <<'PYEOF'
+          import re
+          import sys
+          import pathlib
+
+          root = pathlib.Path(sys.argv[1])
+
+          man = root / "android/app/src/main/AndroidManifest.xml"
+          t = man.read_text(encoding="utf-8")
+
+          if "xmlns:tools" not in t:
+              t = t.replace("<manifest ", '<manifest xmlns:tools="http://schemas.android.com/tools" ', 1)
+
+          perms = [
+              "INTERNET",
+              "POST_NOTIFICATIONS",
+              "FOREGROUND_SERVICE",
+              "FOREGROUND_SERVICE_DATA_SYNC",
+              "WAKE_LOCK",
+          ]
+          add = "".join(
+              f'    <uses-permission android:name="android.permission.{p}"/>\n' for p in perms
+              if f"android.permission.{p}" not in t
+          )
+          assert "<application" in t, "application tag not found"
+          t = t.replace("<application", add + "    <application", 1)
+          t = t.replace("<application", '<application android:usesCleartextTraffic="true"', 1)
+          t = t.replace('android:label="payam"', 'android:label="پیام"')
+
+          service = (
+              '        <service\n'
+              '            android:name="id.flutter.flutter_background_service.BackgroundService"\n'
+              '            android:foregroundServiceType="dataSync"\n'
+              '            tools:replace="android:foregroundServiceType" />\n'
+          )
+          assert "</application>" in t, "closing application tag not found"
+          t = t.replace("</application>", service + "    </application>", 1)
+          man.write_text(t, encoding="utf-8")
+          print("manifest patched")
+
+          done = False
+          kts = root / "android/app/build.gradle.kts"
+          groovy = root / "android/app/build.gradle"
+          if kts.exists():
+              s = kts.read_text(encoding="utf-8")
+              if "isCoreLibraryDesugaringEnabled" not in s:
+                  s, n = re.subn(r"compileOptions\s*\{", "compileOptions {\n        isCoreLibraryDesugaringEnabled = true", s, count=1)
+                  assert n == 1, "compileOptions not found in build.gradle.kts"
+                  s += '\ndependencies {\n    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4")\n}\n'
+                  kts.write_text(s, encoding="utf-8")
+              done = True
+          elif groovy.exists():
+              s = groovy.read_text(encoding="utf-8")
+              if "coreLibraryDesugaringEnabled" not in s:
+                  s, n = re.subn(r"compileOptions\s*\{", "compileOptions {\n        coreLibraryDesugaringEnabled true", s, count=1)
+                  assert n == 1, "compileOptions not found in build.gradle"
+                  s += "\ndependencies {\n    coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.1.4'\n}\n"
+                  groovy.write_text(s, encoding="utf-8")
+              done = True
+          assert done, "no app gradle file found"
+          print("gradle patched")
+          PYEOF
           flutter create --platforms=android --project-name payam --org com.payam build_app
           cp "$SRC/pubspec.yaml" build_app/pubspec.yaml
           rm -rf build_app/lib build_app/test
           cp -r "$SRC/lib" build_app/lib
           cd build_app
-          M=android/app/src/main/AndroidManifest.xml
-          sed -i 's#<application#<uses-permission android:name="android.permission.INTERNET"/>\n    <application android:usesCleartextTraffic="true"#' $M
-          sed -i 's#android:label="payam"#android:label="پیام"#' $M
+          python3 /tmp/patch_android.py .
           flutter pub get
           flutter build apk --release
       - uses: actions/upload-artifact@v4
