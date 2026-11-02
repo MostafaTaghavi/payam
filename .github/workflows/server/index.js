@@ -60,6 +60,7 @@ app.get('/chats', auth, (req, res) => {
   const map = {};
   for (const m of db.messages) {
     if (m.from !== me && m.to !== me) continue;
+    if ((m.hiddenFor || []).includes(me)) continue;
     const peer = m.from === me ? m.to : m.from;
     const c = map[peer] || (map[peer] = { unread: 0 });
     c.last = m;
@@ -72,7 +73,45 @@ app.get('/chats', auth, (req, res) => {
 
 app.get('/messages/:peer', auth, (req, res) => {
   const me = req.user.id, p = req.params.peer;
-  res.json(db.messages.filter((m) => (m.from === me && m.to === p) || (m.from === p && m.to === me)));
+  res.json(db.messages.filter((m) => ((m.from === me && m.to === p) || (m.from === p && m.to === me)) && !(m.hiddenFor || []).includes(me)));
+});
+
+const EDIT_MS = 15 * 60 * 1000;        // ویرایش تا ۱۵ دقیقه
+const DELETE_ALL_MS = 48 * 3600 * 1000; // حذف برای همه تا ۴۸ ساعت
+
+app.patch('/messages/:id', auth, (req, res) => {
+  const m = db.messages.find((x) => x.id === req.params.id);
+  if (!m || m.from !== req.user.id) return res.status(404).json({ error: 'پیام پیدا نشد' });
+  if (m.deleted) return res.status(400).json({ error: 'این پیام حذف شده است' });
+  if (Date.now() - m.time > EDIT_MS) return res.status(400).json({ error: 'زمان ویرایش (۱۵ دقیقه) گذشته است' });
+  const text = String(req.body.text || '').trim().slice(0, 4000);
+  if (!text) return res.status(400).json({ error: 'متن پیام خالی است' });
+  m.text = text;
+  m.edited = true;
+  save();
+  push(m.from, { type: 'edit', message: m });
+  push(m.to, { type: 'edit', message: m });
+  res.json(m);
+});
+
+app.delete('/messages/:id', auth, (req, res) => {
+  const me = req.user.id;
+  const m = db.messages.find((x) => x.id === req.params.id);
+  if (!m || (m.from !== me && m.to !== me)) return res.status(404).json({ error: 'پیام پیدا نشد' });
+  if (req.query.all === '1') {
+    if (m.from !== me) return res.status(403).json({ error: 'فقط فرستنده می‌تواند برای همه حذف کند' });
+    if (Date.now() - m.time > DELETE_ALL_MS) return res.status(400).json({ error: 'زمان حذف برای همه (۴۸ ساعت) گذشته است' });
+    m.deleted = true;
+    m.text = '';
+    save();
+    push(m.from, { type: 'delete', id: m.id, scope: 'all' });
+    push(m.to, { type: 'delete', id: m.id, scope: 'all' });
+  } else {
+    m.hiddenFor = [...new Set([...(m.hiddenFor || []), me])];
+    save();
+    push(me, { type: 'delete', id: m.id, scope: 'me' });
+  }
+  res.json({ ok: true });
 });
 
 const server = http.createServer(app);
@@ -98,7 +137,7 @@ wss.on('connection', (ws, req) => {
       if (online.has(d.to) && online.get(d.to).size) m.status = 'delivered';
       db.messages.push(m); save();
       push(user.id, { type: 'msg', message: m });
-      push(d.to, { type: 'msg', message: m });
+      push(d.to, { type: 'msg', message: m, fromName: user.name });
     } else if (d.type === 'typing') {
       push(d.to, { type: 'typing', from: user.id });
     } else if (d.type === 'read') {

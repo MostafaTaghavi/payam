@@ -10,5 +10,7 @@ dependencies:
   http: ^1.2.0
   web_socket_channel: ^2.4.0
   shared_preferences: ^2.2.0
+  flutter_local_notifications: ^19.0.0
+  flutter_background_service: ^5.0.0
 flutter:
   uses-material-design: true

@@ -1,9 +1,11 @@
 import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
+import 'bg.dart';
 
 const kRed = Color(0xFFFD1D3F);
 const kDark = Color(0xFF20222F);
@@ -36,6 +38,18 @@ class Api {
     return jsonDecode(utf8.decode(r.bodyBytes));
   }
 
+  static dynamic _out(http.Response r) {
+    final j = jsonDecode(utf8.decode(r.bodyBytes));
+    if (r.statusCode >= 400) throw (j['error'] ?? 'خطا');
+    return j;
+  }
+
+  static Future<dynamic> patch(String p, Map b) async =>
+      _out(await http.patch(Uri.parse('$base$p'), headers: _h, body: jsonEncode(b)));
+
+  static Future<dynamic> del(String p) async =>
+      _out(await http.delete(Uri.parse('$base$p'), headers: _h));
+
   static Future<bool> load() async {
     final p = await SharedPreferences.getInstance();
     base = p.getString('base') ?? base;
@@ -53,6 +67,7 @@ class Api {
   }
 
   static Future<void> logout() async {
+    Bg.stop();
     _run = false;
     _ch?.sink.close();
     final p = await SharedPreferences.getInstance();
@@ -85,10 +100,36 @@ class Api {
   static void send(Map m) => _ch?.sink.add(jsonEncode(m));
 }
 
-void main() => runApp(const PayamApp());
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await initNotifications();
+  runApp(const PayamApp());
+}
 
-class PayamApp extends StatelessWidget {
+class PayamApp extends StatefulWidget {
   const PayamApp({super.key});
+  @override
+  State<PayamApp> createState() => _PayamAppState();
+}
+
+class _PayamAppState extends State<PayamApp> with WidgetsBindingObserver {
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    Bg.setForeground(state == AppLifecycleState.resumed);
+  }
+
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
@@ -221,21 +262,32 @@ class ChatsScreen extends StatefulWidget {
   State<ChatsScreen> createState() => _ChatsScreenState();
 }
 
-class _ChatsScreenState extends State<ChatsScreen> {
+class _ChatsScreenState extends State<ChatsScreen> with WidgetsBindingObserver {
   List chats = [];
   StreamSubscription? sub;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     load();
     sub = Api.events.stream.listen((e) {
-      if (e['type'] == 'msg' || e['type'] == 'status') load();
+      if (['msg', 'status', 'edit', 'delete'].contains(e['type'])) load();
     });
+    requestNotificationPermission().whenComplete(Bg.start);
   }
 
   @override
-  void dispose() { sub?.cancel(); super.dispose(); }
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    sub?.cancel();
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) load();
+  }
 
   Future<void> load() async {
     try {
@@ -283,7 +335,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
                 return ListTile(
                   leading: CircleAvatar(backgroundColor: kRed, child: Text(peer['name'].toString().characters.first, style: const TextStyle(color: Colors.white))),
                   title: Text(peer['name']),
-                  subtitle: Text(c['last']['text'], maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(color: Colors.white54)),
+                  subtitle: Text(c['last']['deleted'] == true ? '🚫 این پیام حذف شد' : c['last']['text'], maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(color: Colors.white54)),
                   trailing: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
                     Text(hhmm(c['last']['time']), style: const TextStyle(fontSize: 12, color: Colors.white54)),
                     if (c['unread'] > 0)
@@ -352,25 +404,42 @@ class ChatScreen extends StatefulWidget {
   State<ChatScreen> createState() => _ChatScreenState();
 }
 
-class _ChatScreenState extends State<ChatScreen> {
+class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
+  static const int editMs = 15 * 60 * 1000;
+  static const int deleteAllMs = 48 * 3600 * 1000;
+
   List<Map> msgs = [];
   final input = TextEditingController();
   StreamSubscription? sub;
   bool typing = false;
   Timer? typingTimer;
   DateTime lastSent = DateTime.fromMillisecondsSinceEpoch(0);
+  Map? editing;
 
   String get pid => widget.peer['id'];
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     load();
     sub = Api.events.stream.listen(onEvent);
   }
 
   @override
-  void dispose() { sub?.cancel(); typingTimer?.cancel(); super.dispose(); }
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    sub?.cancel();
+    typingTimer?.cancel();
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) load();
+  }
+
+  void toast(String s) => ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(s)));
 
   Future<void> load() async {
     try {
@@ -383,33 +452,142 @@ class _ChatScreenState extends State<ChatScreen> {
 
   void onEvent(Map e) {
     if (!mounted) return;
-    if (e['type'] == 'msg') {
+    final t = e['type'];
+    if (t == 'msg') {
       final m = Map.from(e['message']);
       if (m['from'] == pid || m['to'] == pid) {
         setState(() => msgs.add(m));
         if (m['from'] == pid) Api.send({'type': 'read', 'peer': pid});
       }
-    } else if (e['type'] == 'status') {
+    } else if (t == 'status') {
       setState(() {
         for (final m in msgs) {
           if (m['id'] == e['id']) m['status'] = e['status'];
         }
       });
-    } else if (e['type'] == 'typing' && e['from'] == pid) {
+    } else if (t == 'edit') {
+      final m = Map.from(e['message']);
+      setState(() {
+        final i = msgs.indexWhere((x) => x['id'] == m['id']);
+        if (i >= 0) msgs[i] = m;
+      });
+    } else if (t == 'delete') {
+      applyDelete(e['id'], e['scope'] == 'all');
+    } else if (t == 'typing' && e['from'] == pid) {
       setState(() => typing = true);
       typingTimer?.cancel();
-      typingTimer = Timer(const Duration(seconds: 2), () { if (mounted) setState(() => typing = false); });
+      typingTimer = Timer(const Duration(seconds: 2), () {
+        if (mounted) setState(() => typing = false);
+      });
     }
   }
 
-  void send() {
+  void applyDelete(dynamic id, bool all) {
+    setState(() {
+      if (all) {
+        for (final m in msgs) {
+          if (m['id'] == id) {
+            m['deleted'] = true;
+            m['text'] = '';
+          }
+        }
+      } else {
+        msgs.removeWhere((x) => x['id'] == id);
+      }
+      if (editing != null && editing!['id'] == id) {
+        editing = null;
+        input.clear();
+      }
+    });
+  }
+
+  Future<void> send() async {
     final t = input.text.trim();
     if (t.isEmpty) return;
+    if (editing != null) {
+      final m = editing!;
+      if (t == m['text']) {
+        cancelEdit();
+        return;
+      }
+      try {
+        final r = await Api.patch('/messages/${m['id']}', {'text': t});
+        if (!mounted) return;
+        setState(() {
+          final i = msgs.indexWhere((x) => x['id'] == m['id']);
+          if (i >= 0) msgs[i] = Map.from(r);
+        });
+        cancelEdit();
+      } catch (err) {
+        toast(err.toString());
+      }
+      return;
+    }
     Api.send({'type': 'msg', 'to': pid, 'text': t});
     input.clear();
   }
 
+  void cancelEdit() {
+    setState(() => editing = null);
+    input.clear();
+  }
+
+  Future<void> delMsg(Map m, bool all) async {
+    Navigator.pop(context);
+    try {
+      await Api.del('/messages/${m['id']}${all ? '?all=1' : ''}');
+      if (mounted) applyDelete(m['id'], all);
+    } catch (err) {
+      toast(err.toString());
+    }
+  }
+
+  void openMenu(Map m) {
+    final mine = m['from'] == Api.me!['id'];
+    final age = DateTime.now().millisecondsSinceEpoch - (m['time'] as int);
+    final deleted = m['deleted'] == true;
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: kDarker,
+      builder: (_) => SafeArea(
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          if (!deleted)
+            ListTile(
+              leading: const Icon(Icons.copy),
+              title: const Text('کپی'),
+              onTap: () {
+                Navigator.pop(context);
+                Clipboard.setData(ClipboardData(text: m['text']));
+              },
+            ),
+          if (!deleted && mine && age < editMs)
+            ListTile(
+              leading: const Icon(Icons.edit_outlined),
+              title: const Text('ویرایش'),
+              onTap: () {
+                Navigator.pop(context);
+                setState(() => editing = m);
+                input.text = m['text'];
+              },
+            ),
+          ListTile(
+            leading: const Icon(Icons.delete_outline),
+            title: const Text('حذف برای من'),
+            onTap: () => delMsg(m, false),
+          ),
+          if (!deleted && mine && age < deleteAllMs)
+            ListTile(
+              leading: const Icon(Icons.delete_forever, color: kRed),
+              title: const Text('حذف برای همه', style: TextStyle(color: kRed)),
+              onTap: () => delMsg(m, true),
+            ),
+        ]),
+      ),
+    );
+  }
+
   void onChanged(String _) {
+    if (editing != null) return;
     if (DateTime.now().difference(lastSent).inSeconds >= 2) {
       lastSent = DateTime.now();
       Api.send({'type': 'typing', 'to': pid});
@@ -444,32 +622,53 @@ class _ChatScreenState extends State<ChatScreen> {
             itemBuilder: (_, i) {
               final m = msgs[msgs.length - 1 - i];
               final mine = m['from'] == myId;
+              final deleted = m['deleted'] == true;
               return Align(
                 alignment: mine ? Alignment.centerRight : Alignment.centerLeft,
-                child: Container(
-                  margin: const EdgeInsets.symmetric(vertical: 3),
-                  padding: const EdgeInsets.fromLTRB(12, 8, 12, 6),
-                  constraints: BoxConstraints(maxWidth: MediaQuery.of(context).size.width * 0.75),
-                  decoration: BoxDecoration(
-                    color: mine ? kRed : kCard,
-                    borderRadius: BorderRadius.only(
-                      topLeft: const Radius.circular(16), topRight: const Radius.circular(16),
-                      bottomRight: Radius.circular(mine ? 4 : 16), bottomLeft: Radius.circular(mine ? 16 : 4),
+                child: GestureDetector(
+                  onLongPress: () => openMenu(m),
+                  child: Container(
+                    margin: const EdgeInsets.symmetric(vertical: 3),
+                    padding: const EdgeInsets.fromLTRB(12, 8, 12, 6),
+                    constraints: BoxConstraints(maxWidth: MediaQuery.of(context).size.width * 0.75),
+                    decoration: BoxDecoration(
+                      color: deleted ? kCard : (mine ? kRed : kCard),
+                      borderRadius: BorderRadius.only(
+                        topLeft: const Radius.circular(16), topRight: const Radius.circular(16),
+                        bottomRight: Radius.circular(mine ? 4 : 16), bottomLeft: Radius.circular(mine ? 16 : 4),
+                      ),
                     ),
-                  ),
-                  child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
-                    Text(m['text'], style: const TextStyle(fontSize: 16)),
-                    const SizedBox(height: 2),
-                    Row(mainAxisSize: MainAxisSize.min, children: [
-                      Text(hhmm(m['time']), style: const TextStyle(fontSize: 11, color: Colors.white70)),
-                      if (mine) ...[const SizedBox(width: 4), tick(m['status'])],
+                    child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+                      deleted
+                          ? const Text('🚫 این پیام حذف شد', style: TextStyle(fontSize: 15, fontStyle: FontStyle.italic, color: Colors.white60))
+                          : Text(m['text'], style: const TextStyle(fontSize: 16)),
+                      const SizedBox(height: 2),
+                      Row(mainAxisSize: MainAxisSize.min, children: [
+                        if (m['edited'] == true && !deleted) ...[
+                          const Text('ویرایش‌شده', style: TextStyle(fontSize: 11, color: Colors.white70)),
+                          const SizedBox(width: 6),
+                        ],
+                        Text(hhmm(m['time']), style: const TextStyle(fontSize: 11, color: Colors.white70)),
+                        if (mine && !deleted) ...[const SizedBox(width: 4), tick(m['status'])],
+                      ]),
                     ]),
-                  ]),
+                  ),
                 ),
               );
             },
           ),
         ),
+        if (editing != null)
+          Container(
+            color: kCard,
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+            child: Row(children: [
+              const Icon(Icons.edit, size: 18, color: kRed),
+              const SizedBox(width: 8),
+              Expanded(child: Text('ویرایش پیام: ${editing!['text']}', maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(color: Colors.white70))),
+              IconButton(icon: const Icon(Icons.close), onPressed: cancelEdit),
+            ]),
+          ),
         SafeArea(
           child: Container(
             color: kDarker,
@@ -481,11 +680,14 @@ class _ChatScreenState extends State<ChatScreen> {
                   onChanged: onChanged,
                   minLines: 1,
                   maxLines: 5,
-                  decoration: const InputDecoration(hintText: 'پیام...', contentPadding: EdgeInsets.symmetric(horizontal: 16, vertical: 10)),
+                  decoration: InputDecoration(hintText: editing != null ? 'متن جدید...' : 'پیام...', contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10)),
                 ),
               ),
               const SizedBox(width: 8),
-              CircleAvatar(backgroundColor: kRed, child: IconButton(icon: const Icon(Icons.send, color: Colors.white), onPressed: send)),
+              CircleAvatar(
+                backgroundColor: kRed,
+                child: IconButton(icon: Icon(editing != null ? Icons.check : Icons.send, color: Colors.white), onPressed: send),
+              ),
             ]),
           ),
         ),
